@@ -74,6 +74,7 @@ func addBody(d *pluginv1.RequestDescriptor) map[string]any {
 		"media_type": d.GetMediaType(),
 		"tmdb":       ids["tmdb"],
 		"imdb":       ids["imdb"],
+		"tvdb":       ids["tvdb"],
 	}
 }
 
@@ -99,8 +100,9 @@ func (r *routerServer) Fulfill(ctx context.Context, in *pluginv1.FulfillRequest)
 	}
 	conn := conns[0]
 	d := in.GetRequest()
-	if d.GetMediaType() != "movie" {
-		return &pluginv1.FulfillResponse{Message: "only movies are supported right now"}, nil
+	mt := d.GetMediaType()
+	if mt != "movie" && mt != "series" {
+		return &pluginv1.FulfillResponse{Message: "unsupported media type"}, nil
 	}
 
 	out, code, err := gwCall(conn, http.MethodPost, "/add", addBody(d))
