@@ -77,8 +77,11 @@ def _radarr_titles():
     for m in movies:
         if not m.get("monitored", True):
             continue
-        if RADARR_FILTER == "missing" and m.get("hasFile"):
-            continue
+        if RADARR_FILTER == "missing":
+            if m.get("hasFile"):
+                continue
+            if not m.get("isAvailable"):   # skip unreleased; it cannot be on usenet yet
+                continue
         title, year = m.get("title"), m.get("year")
         if not title:
             continue
@@ -211,10 +214,12 @@ class H(BaseHTTPRequestHandler):
                     self.wfile.write(body)
             elif len(parts) == 1:
                 t = parts[0]
-                e = resolve(t, titles[t]) if t in titles else None
-                if not e:
+                if t not in titles:
                     self._head(404, {"Content-Type": "text/plain"}, 0); return
-                body = _listing([], [e["file"]])
+                e = resolve(t, titles[t])
+                # unresolvable title -> empty folder (200) so the scanner does
+                # not error; Silo just adds no item for it
+                body = _listing([], [e["file"]] if e else [])
                 self._head(200, {"Content-Type": "text/html"}, len(body))
                 if not head:
                     self.wfile.write(body)
