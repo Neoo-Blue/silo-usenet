@@ -8,7 +8,7 @@ Easynews direct-download URL with HTTP Range, so nothing is pre-downloaded.
 Configuration comes from environment variables plus a hot-reloaded titles file.
 Standard library only.
 """
-import base64, json, os, re, threading, time, urllib.request, urllib.error, urllib.parse
+import base64, hashlib, json, os, re, threading, time, urllib.request, urllib.error, urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 U = os.environ["EASYNEWS_USER"]
@@ -29,6 +29,12 @@ RADARR_FILTER = os.environ.get("RADARR_FILTER", "missing").lower()   # missing |
 SONARR_URL = os.environ.get("SONARR_URL", "").rstrip("/")   # reserved for series
 SOURCE_TTL = int(os.environ.get("SOURCE_TTL", "120"))
 MAX_TITLES = int(os.environ.get("MAX_TITLES", "0"))   # cap total exposed titles (0 = unlimited)
+MAX_VERSIONS = int(os.environ.get("MAX_VERSIONS", "6"))   # usenet releases exposed per title (the "stream list")
+# local head/tail cache so the first play starts instantly (Easynews has no
+# per-user cache, so we pre-fetch the openable bytes to disk ourselves)
+HEAD_CACHE_DIR = os.environ.get("HEAD_CACHE_DIR", "/opt/usenet-vfs/headcache")
+HEAD_CACHE_MB = int(os.environ.get("HEAD_CACHE_MB", "24"))
+TAIL_CACHE_MB = int(os.environ.get("TAIL_CACHE_MB", "8"))
 
 # control API (called by the Silo request-router plugin to make a title playable)
 CONTROL_BIND = os.environ.get("CONTROL_BIND", "0.0.0.0")
@@ -201,8 +207,19 @@ def load_tv_shows():
     return out
 
 
-def build_entry(title, query):
-    d = en_search(query)
+_RES_RE = re.compile(r"(2160p|1080p|720p|480p|4k|uhd)", re.I)
+
+
+def _quality_label(c):
+    m = _RES_RE.search(c["raw"])
+    res = m.group(1).upper() if m else c["ext"][1:].upper()
+    return "%s %.1fGB" % (res, c["size"] / (1024 ** 3))
+
+
+def build_versions(title, query):
+    """Top usenet releases for a title, each a distinct file so Silo shows them
+    as selectable versions (the 'stream list'), best quality first."""
+    d = en_search(query, pby=120)
     downURL, dlFarm = d.get("downURL"), d.get("dlFarm")
     cands = []
     for it in d.get("data", []):
@@ -215,40 +232,87 @@ def build_entry(title, query):
         subj = (it.get("6") or "").lower()
         fn = it.get("10") or it.get("fn") or title
         cands.append({
-            "size": size, "ext": ext, "file": title + ext,
-            "rar": (".rar" in subj or "autounrar" in subj),
+            "size": size, "ext": ext, "raw": fn,
+            "rar": 1 if (".rar" in subj or "autounrar" in subj) else 0,
             "url": "%s/%s/%s/%s%s/%s" % (downURL, dlFarm, it["sig"], it["hash"], ext,
                                          urllib.parse.quote(fn + ext)),
         })
-    if not cands:
-        return None
-
-    def quality(c):
-        return (PREF.get(c["ext"], 9), -c["size"])   # lower is better
-
-    best = min(cands, key=quality)
-    # prefer a non-RAR post, but only if it is not much worse than the best
-    # overall (RAR/AutoUnRAR posts can be flaky on seeks, but a tiny non-RAR
-    # sample is worse than a good AutoUnRAR release)
-    non_rar = [c for c in cands if not c["rar"]]
-    if non_rar:
-        best_non_rar = min(non_rar, key=quality)
-        if best_non_rar["size"] >= REQUIRE_NONRAR_RATIO * best["size"]:
-            best = best_non_rar
-    return best
+    cands.sort(key=lambda c: (c["rar"], PREF.get(c["ext"], 9), -c["size"]))
+    out, seen = [], set()
+    for c in cands:
+        label = _quality_label(c)
+        fname = "%s - %s%s" % (title, label, c["ext"])
+        i = 2
+        while fname in seen:
+            fname = "%s - %s (%d)%s" % (title, label, i, c["ext"]); i += 1
+        seen.add(fname)
+        c["file"] = fname
+        out.append(c)
+        if len(out) >= MAX_VERSIONS:
+            break
+    return out
 
 
-def resolve(title, query, force=False):
+def resolve_versions(title, query, force=False):
     now = time.time()
     with _lock:
         c = _cache.get(title)
         if c and not force and now - c[0] < TTL:
             return c[1]
-    entry = build_entry(title, query)
-    if entry:
+    vs = build_versions(title, query)
+    if vs:
         with _lock:
-            _cache[title] = (now, entry)
-    return entry
+            _cache[title] = (now, vs)
+    return vs
+
+
+_warm_lock = threading.Lock()
+_warming = set()
+
+
+def cache_key(url):
+    return hashlib.sha1(url.encode()).hexdigest()
+
+
+def _fetch_range_to(url, start, length, path):
+    try:
+        r = en_open(url, rng="bytes=%d-%d" % (start, start + length - 1), timeout=90)
+        data = r.read()
+        r.close()
+        os.makedirs(HEAD_CACHE_DIR, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def prewarm_versions(versions):
+    """Fetch each release's head (and tail) to local disk in the background, so
+    the first play is served locally instead of round-tripping to Easynews."""
+    for v in versions:
+        key = cache_key(v["url"])
+        with _warm_lock:
+            if key in _warming:
+                continue
+            _warming.add(key)
+
+        def _do(v=v, key=key):
+            try:
+                size = v["size"]
+                head = min(HEAD_CACHE_MB << 20, size)
+                if not os.path.exists(os.path.join(HEAD_CACHE_DIR, key + ".head")):
+                    _fetch_range_to(v["url"], 0, head, os.path.join(HEAD_CACHE_DIR, key + ".head"))
+                if TAIL_CACHE_MB > 0 and size > head + (TAIL_CACHE_MB << 20):
+                    if not os.path.exists(os.path.join(HEAD_CACHE_DIR, key + ".tail")):
+                        _fetch_range_to(v["url"], size - (TAIL_CACHE_MB << 20), TAIL_CACHE_MB << 20,
+                                        os.path.join(HEAD_CACHE_DIR, key + ".tail"))
+            finally:
+                with _warm_lock:
+                    _warming.discard(key)
+
+        threading.Thread(target=_do, daemon=True).start()
 
 
 def _listing(dirs, files):
@@ -293,19 +357,21 @@ class H(BaseHTTPRequestHandler):
                 t = parts[0]
                 if t not in titles:
                     self._head(404, {"Content-Type": "text/plain"}, 0); return
-                e = resolve(t, titles[t])
-                # unresolvable title -> empty folder (200) so the scanner does
-                # not error; Silo just adds no item for it
-                body = _listing([], [e["file"]] if e else [])
+                vs = resolve_versions(t, titles[t])
+                # each release is a distinct file -> Silo shows them as versions
+                # (the stream list); unresolvable -> empty folder (no scan error)
+                body = _listing([], [v["file"] for v in vs])
                 self._head(200, {"Content-Type": "text/html"}, len(body))
                 if not head:
                     self.wfile.write(body)
             elif len(parts) == 2:
                 t, fname = parts
-                e = resolve(t, titles[t]) if t in titles else None
-                if not e or fname != e["file"]:
+                if t not in titles:
                     self._head(404, {"Content-Type": "text/plain"}, 0); return
-                self._stream(t, titles[t], e, head)
+                ent = next((v for v in resolve_versions(t, titles[t]) if v["file"] == fname), None)
+                if not ent:
+                    self._head(404, {"Content-Type": "text/plain"}, 0); return
+                self._stream(t, titles[t], ent, head)
             else:
                 self._head(404, {"Content-Type": "text/plain"}, 0)
         except (BrokenPipeError, ConnectionResetError):
@@ -322,6 +388,8 @@ class H(BaseHTTPRequestHandler):
             self._head(200, {"Accept-Ranges": "bytes", "Content-Type": ctype}, e["size"])
             return
         rng = self.headers.get("Range")
+        if self._serve_cache(e["url"], e["size"], e["ext"], rng, ctype):
+            return
         up = None
         for attempt in (0, 1):
             try:
@@ -329,7 +397,7 @@ class H(BaseHTTPRequestHandler):
                 break
             except urllib.error.HTTPError as ex:
                 if ex.code in (401, 403, 404, 410) and attempt == 0:
-                    e2 = resolve(title, query, force=True)   # signed URL likely expired
+                    e2 = next((v for v in resolve_versions(title, query, force=True) if v["file"] == e["file"]), None)
                     if e2:
                         e = e2; continue
                 self._head(ex.code, {"Content-Type": "text/plain"}, 0); return
@@ -355,6 +423,51 @@ class H(BaseHTTPRequestHandler):
             pass
         finally:
             up.close()
+
+    def _serve_cache(self, url, size, ext, rng, ctype):
+        """Serve a byte range from the local head/tail cache if it is fully
+        covered there. Makes the first play start without hitting Easynews."""
+        if not rng or not rng.startswith("bytes="):
+            return False
+        try:
+            a, _, b = rng[6:].partition("-")
+            start = int(a)
+            end = int(b) if b else size - 1
+        except Exception:
+            return False
+        key = cache_key(url)
+        headp = os.path.join(HEAD_CACHE_DIR, key + ".head")
+        tailp = os.path.join(HEAD_CACHE_DIR, key + ".tail")
+        try:
+            if os.path.exists(headp):
+                hlen = os.path.getsize(headp)
+                if start < hlen and end < hlen:
+                    with open(headp, "rb") as f:
+                        f.seek(start)
+                        return self._range_resp(start, end, size, f.read(end - start + 1), ctype)
+            if os.path.exists(tailp):
+                tlen = os.path.getsize(tailp)
+                toff = size - tlen
+                if start >= toff and end < size:
+                    with open(tailp, "rb") as f:
+                        f.seek(start - toff)
+                        return self._range_resp(start, end, size, f.read(end - start + 1), ctype)
+        except Exception:
+            return False
+        return False
+
+    def _range_resp(self, start, end, size, data, ctype):
+        self.send_response(206)
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, size))
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        try:
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        return True
 
     def _route_tv(self, parts, head):
         shows = load_tv_shows()
@@ -477,6 +590,14 @@ def silo_scan(lib_id=None):
             pass
 
 
+def silo_scan_path(path):
+    if SILO_URL and SILO_API_KEY:
+        try:
+            silo_call("POST", "/scan", {"path": path})
+        except Exception:
+            pass
+
+
 def silo_has(tmdb):
     if not (SILO_URL and SILO_API_KEY and tmdb):
         return False
@@ -592,13 +713,14 @@ class Control(BaseHTTPRequestHandler):
                 return self._json(200, {"ok": True, "available": silo_has_series(tvdb, tmdb), "message": "streamable"})
             query = ("%s %s" % (title, year)) if year else title
             try:
-                found = build_entry(disp, query) is not None
+                vers = build_versions(disp, query)
             except Exception:
-                found = False
-            if not found:
+                vers = []
+            if not vers:
                 return self._json(200, {"ok": False, "available": False, "message": "not available on usenet"})
             add_dynamic_title(disp, query)
-            silo_scan()
+            prewarm_versions(vers)                                  # warm heads for instant play
+            silo_scan_path("/mnt/library/usenet-live/%s" % disp)   # targeted scan (fast)
             return self._json(200, {"ok": True, "available": silo_has(tmdb), "message": "streamable"})
         if path == "/status":
             if media_type == "series":
