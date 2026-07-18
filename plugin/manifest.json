@@ -1,0 +1,14 @@
+{
+  "plugin_id": "usenet.ondemand-router",
+  "version": "0.1.0",
+  "checksum": "__CHECKSUM__",
+  "silo_api_version": "v1",
+  "capabilities": [
+    {
+      "type": "request_router.v1",
+      "id": "usenet",
+      "display_name": "Usenet On-Demand",
+      "description": "Fulfill discover requests by making titles instantly streamable from usenet (via the silo-usenet gateway)."
+    }
+  ]
+}

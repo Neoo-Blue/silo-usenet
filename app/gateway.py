@@ -30,6 +30,15 @@ SONARR_URL = os.environ.get("SONARR_URL", "").rstrip("/")   # reserved for serie
 SOURCE_TTL = int(os.environ.get("SOURCE_TTL", "120"))
 MAX_TITLES = int(os.environ.get("MAX_TITLES", "0"))   # cap total exposed titles (0 = unlimited)
 
+# control API (called by the Silo request-router plugin to make a title playable)
+CONTROL_BIND = os.environ.get("CONTROL_BIND", "0.0.0.0")
+CONTROL_PORT = int(os.environ.get("CONTROL_PORT", "0"))     # 0 = control API disabled
+CONTROL_TOKEN = os.environ.get("CONTROL_TOKEN", "")
+DYNAMIC_TITLES_FILE = os.environ.get("DYNAMIC_TITLES_FILE", "/opt/usenet-vfs/dynamic-titles.json")
+SILO_URL = os.environ.get("SILO_URL", "").rstrip("/")
+SILO_API_KEY = os.environ.get("SILO_API_KEY", "")
+SILO_LIBRARY_ID = int(os.environ.get("SILO_LIBRARY_ID", "0"))   # usenet-live library id (for scans)
+
 BASE = "https://members.easynews.com"
 AUTH = "Basic " + base64.b64encode(("%s:%s" % (U, P)).encode()).decode()
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) SiloUsenet/1.0"
@@ -98,12 +107,20 @@ def load_titles():
         return _titles_cache["val"]
     merged = {}
     merged.update(_file_titles())
+    radarr = {}
     try:
-        merged.update(_radarr_titles())
+        radarr = _radarr_titles()
     except Exception:
         pass
-    if MAX_TITLES > 0 and len(merged) > MAX_TITLES:
-        merged = dict(list(merged.items())[:MAX_TITLES])
+    if MAX_TITLES > 0 and len(radarr) > MAX_TITLES:   # cap only the Radarr backlog
+        radarr = dict(list(radarr.items())[:MAX_TITLES])
+    merged.update(radarr)
+    try:                                     # on-demand titles from the plugin are never capped
+        for e in json.load(open(DYNAMIC_TITLES_FILE)):
+            if isinstance(e, dict) and e.get("title"):
+                merged[e["title"]] = e.get("query") or e["title"]
+    except Exception:
+        pass
     _titles_cache["ts"] = now
     _titles_cache["val"] = merged
     return merged
@@ -280,6 +297,127 @@ class H(BaseHTTPRequestHandler):
             up.close()
 
 
+# --------------------------------------------------------------------------- #
+# control API: the Silo request-router plugin calls this to make a title
+# playable on demand. /add searches usenet, registers the title, and triggers a
+# Silo scan; /status reports whether Silo has indexed it yet.
+# --------------------------------------------------------------------------- #
+import os
+_dyn_lock = threading.Lock()
+
+
+def silo_call(method, path, body=None):
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(SILO_URL + "/api/v1" + path, data=data, method=method)
+    req.add_header("Authorization", "Bearer " + SILO_API_KEY)
+    if data:
+        req.add_header("Content-Type", "application/json")
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return r.status, r.read().decode()
+
+
+def silo_scan():
+    if SILO_URL and SILO_API_KEY and SILO_LIBRARY_ID:
+        try:
+            silo_call("POST", "/scan", {"library_id": SILO_LIBRARY_ID})
+        except Exception:
+            pass
+
+
+def silo_has(tmdb):
+    if not (SILO_URL and SILO_API_KEY and tmdb):
+        return False
+    try:
+        st, b = silo_call("GET", "/catalog/items/movie-tmdb-%s" % tmdb)
+        if st != 200:
+            return False
+        for v in (json.loads(b).get("versions") or []):
+            if str(v.get("file_path") or "").startswith("/mnt/library/usenet-live"):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def add_dynamic_title(title, query):
+    with _dyn_lock:
+        try:
+            cur = json.load(open(DYNAMIC_TITLES_FILE))
+        except Exception:
+            cur = []
+        if not any(isinstance(e, dict) and e.get("title") == title for e in cur):
+            cur.append({"title": title, "query": query})
+            tmp = DYNAMIC_TITLES_FILE + ".tmp"
+            open(tmp, "w").write(json.dumps(cur))
+            os.replace(tmp, DYNAMIC_TITLES_FILE)
+    _titles_cache["ts"] = 0.0   # force listings to include the new title immediately
+
+
+class Control(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def _json(self, code, obj):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except Exception:
+            pass
+
+    def _read(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        try:
+            return json.loads(self.rfile.read(n) or b"{}")
+        except Exception:
+            return {}
+
+    def do_GET(self):
+        if self.path.split("?")[0] == "/health":
+            return self._json(200, {"ok": True})
+        self._json(404, {"ok": False})
+
+    def do_POST(self):
+        if CONTROL_TOKEN and self.headers.get("X-Api-Key") != CONTROL_TOKEN:
+            return self._json(401, {"ok": False, "message": "unauthorized"})
+        path = self.path.split("?")[0]
+        body = self._read()
+        title = (body.get("title") or "").strip()
+        year = body.get("year")
+        tmdb = body.get("tmdb")
+        if path == "/add":
+            if not title:
+                return self._json(400, {"ok": False, "message": "title required"})
+            disp = "%s (%s)" % (title, year) if year else title
+            query = ("%s %s" % (title, year)) if year else title
+            try:
+                found = build_entry(disp, query) is not None
+            except Exception:
+                found = False
+            if not found:
+                return self._json(200, {"ok": False, "available": False, "message": "not available on usenet"})
+            add_dynamic_title(disp, query)
+            silo_scan()
+            return self._json(200, {"ok": True, "available": silo_has(tmdb), "message": "streamable"})
+        if path == "/status":
+            avail = silo_has(tmdb)
+            if not avail:
+                silo_scan()   # keep nudging the scan until the title is indexed
+            return self._json(200, {"ok": True, "available": avail})
+        self._json(404, {"ok": False})
+
+
 if __name__ == "__main__":
+    if CONTROL_PORT:
+        threading.Thread(
+            target=lambda: ThreadingHTTPServer((CONTROL_BIND, CONTROL_PORT), Control).serve_forever(),
+            daemon=True,
+        ).start()
+        print("[gateway] control API on %s:%d" % (CONTROL_BIND, CONTROL_PORT), flush=True)
     print("[gateway] listening on %s:%d titles=%s" % (BIND, PORT, TITLES_FILE), flush=True)
     ThreadingHTTPServer((BIND, PORT), H).serve_forever()
