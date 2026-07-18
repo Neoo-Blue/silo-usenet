@@ -11,7 +11,7 @@
 
 services:
   silo-usenet:
-    image: ghcr.io/CHANGEME/silo-usenet:latest   # published by the CI workflow
+    image: ghcr.io/neoo-blue/silo-usenet:latest   # published by the CI workflow
     # build: .                                    # uncomment to build locally instead
     container_name: silo-usenet
     restart: unless-stopped
